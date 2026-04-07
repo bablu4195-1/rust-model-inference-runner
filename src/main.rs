@@ -17,11 +17,27 @@ enum ModelType {
     Gemma,
 }
 
+// ─── Cloud provider selection ────────────────────────────────────────────────
+
+#[derive(Clone, Debug, ValueEnum)]
+enum CloudProvider {
+    /// OpenAI API (gpt-3.5-turbo, gpt-4, etc.)
+    Openai,
+    /// Anthropic API (claude-3-haiku, claude-3-sonnet, etc.)
+    Anthropic,
+    /// Google Vertex AI / Gemini API
+    Google,
+    /// Azure OpenAI Service
+    Azure,
+    /// Ollama local/cloud inference
+    Ollama,
+}
+
 // ─── CLI arguments ────────────────────────────────────────────────────────────
 
 #[derive(Parser, Debug)]
 #[command(name = "rust-inference-model-runner")]
-#[command(about = "Run LLM inference locally with GGUF models via Candle")]
+#[command(about = "Run LLM inference locally with GGUF models via Candle or use cloud APIs")]
 struct Args {
     /// Hugging Face repo ID (e.g. bartowski/Llama-3.2-1B-Instruct-GGUF)
     #[arg(long)]
@@ -38,6 +54,22 @@ struct Args {
     /// Model architecture type
     #[arg(long, default_value = "llama")]
     model_type: ModelType,
+
+    /// Use cloud provider instead of local model
+    #[arg(long)]
+    cloud: Option<CloudProvider>,
+
+    /// API key for cloud provider (or set OPENAI_API_KEY, ANTHROPIC_API_KEY, etc.)
+    #[arg(long, env = "API_KEY")]
+    api_key: Option<String>,
+
+    /// Cloud model name (e.g., gpt-4, claude-3-sonnet-20240229, gemini-pro)
+    #[arg(long)]
+    cloud_model: Option<String>,
+
+    /// Base URL for cloud API (for custom endpoints or Ollama)
+    #[arg(long)]
+    base_url: Option<String>,
 
     /// Prompt for single-turn inference
     #[arg(long, short)]
@@ -119,6 +151,12 @@ fn main() -> Result<()> {
 }
 
 fn run(args: &Args) -> Result<()> {
+    // Check if cloud mode is enabled
+    if let Some(cloud_provider) = &args.cloud {
+        return run_cloud(args, cloud_provider);
+    }
+
+    // Local model inference
     let model_path = resolve_model_path(args)?;
     println!("📦 Model: {}", model_path.display());
 
@@ -350,6 +388,319 @@ fn chat_loop(model: &mut Model, tokenizer: &tokenizers::Tokenizer, args: &Args) 
         print!("🤖 Assistant: ");
         stdout.lock().flush()?;
         generate(model, tokenizer, &prompt, args)?;
+    }
+
+    Ok(())
+}
+
+// ─── Cloud API helpers ───────────────────────────────────────────────────────
+
+/// Get API key from args or environment variables
+fn get_api_key(args: &Args, provider: &CloudProvider) -> Result<String> {
+    if let Some(key) = &args.api_key {
+        return Ok(key.clone());
+    }
+
+    let env_var = match provider {
+        CloudProvider::Openai => "OPENAI_API_KEY",
+        CloudProvider::Anthropic => "ANTHROPIC_API_KEY",
+        CloudProvider::Google => "GOOGLE_API_KEY",
+        CloudProvider::Azure => "AZURE_OPENAI_API_KEY",
+        CloudProvider::Ollama => "", // Ollama doesn't require API key by default
+    };
+
+    if env_var.is_empty() {
+        Ok(String::new())
+    } else {
+        std::env::var(env_var).with_context(|| format!("{} not set. Use --api-key or set {}", env_var, env_var))
+    }
+}
+
+/// Get base URL for cloud provider
+fn get_base_url(args: &Args, provider: &CloudProvider) -> String {
+    if let Some(url) = &args.base_url {
+        return url.clone();
+    }
+
+    match provider {
+        CloudProvider::Openai => "https://api.openai.com/v1".to_string(),
+        CloudProvider::Anthropic => "https://api.anthropic.com/v1".to_string(),
+        CloudProvider::Google => "https://generativelanguage.googleapis.com/v1".to_string(),
+        CloudProvider::Azure => {
+            // Azure requires custom endpoint, use placeholder
+            "https://YOUR_RESOURCE.openai.azure.com/openai/deployments/YOUR_DEPLOYMENT".to_string()
+        }
+        CloudProvider::Ollama => "http://localhost:11434".to_string(),
+    }
+}
+
+/// Get default model name for provider
+fn get_default_model(provider: &CloudProvider) -> &'static str {
+    match provider {
+        CloudProvider::Openai => "gpt-3.5-turbo",
+        CloudProvider::Anthropic => "claude-3-haiku-20240307",
+        CloudProvider::Google => "gemini-pro",
+        CloudProvider::Azure => "gpt-35-turbo",
+        CloudProvider::Ollama => "llama3.2",
+    }
+}
+
+/// Run inference using cloud API
+fn run_cloud(args: &Args, provider: &CloudProvider) -> Result<()> {
+    let api_key = get_api_key(args, provider)?;
+    let base_url = get_base_url(args, provider);
+    let model_name = args.cloud_model.as_deref().unwrap_or_else(|| get_default_model(provider));
+
+    println!("☁️  Cloud Provider: {:?}", provider);
+    println!("🔗 Base URL: {}", base_url);
+    println!("🤖 Model: {}", model_name);
+
+    if args.chat {
+        cloud_chat_loop(args, provider, &api_key, &base_url, model_name)?;
+    } else {
+        let prompt = args.prompt.as_deref().unwrap_or("Hello, how are you?");
+        println!("\n📝 Prompt: {prompt}");
+        println!("──────────────────────────────────────");
+        let output = cloud_generate(args, provider, &api_key, &base_url, model_name, prompt)?;
+        println!("\n✅ Output:\n{output}");
+        println!("──────────────────────────────────────");
+    }
+
+    Ok(())
+}
+
+/// Generate single response from cloud API
+fn cloud_generate(
+    args: &Args,
+    provider: &CloudProvider,
+    api_key: &str,
+    base_url: &str,
+    model: &str,
+    prompt: &str,
+) -> Result<String> {
+    match provider {
+        CloudProvider::Openai => openai_generate(api_key, base_url, model, prompt, args.temperature),
+        CloudProvider::Anthropic => anthropic_generate(api_key, base_url, model, prompt, args.temperature),
+        CloudProvider::Google => google_generate(api_key, base_url, model, prompt, args.temperature),
+        CloudProvider::Azure => azure_generate(api_key, base_url, model, prompt, args.temperature),
+        CloudProvider::Ollama => ollama_generate(api_key, base_url, model, prompt, args.temperature),
+    }
+}
+
+/// OpenAI API generation
+fn openai_generate(
+    api_key: &str,
+    base_url: &str,
+    model: &str,
+    prompt: &str,
+    temperature: f64,
+) -> Result<String> {
+    use serde_json::json;
+
+    let client = reqwest::blocking::Client::new();
+    let url = format!("{}/chat/completions", base_url);
+
+    let response = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", api_key))
+        .header("Content-Type", "application/json")
+        .json(&json!({
+            "model": model,
+            "messages": [
+                {"role": "user", "content": prompt}
+            ],
+            "temperature": temperature,
+            "max_tokens": 1024
+        }))
+        .send()?
+        .error_for_status()?;
+
+    let json: serde_json::Value = response.json()?;
+    let content = json["choices"][0]["message"]["content"]
+        .as_str()
+        .context("Invalid response from OpenAI API")?;
+
+    Ok(content.to_string())
+}
+
+/// Anthropic API generation
+fn anthropic_generate(
+    api_key: &str,
+    base_url: &str,
+    model: &str,
+    prompt: &str,
+    temperature: f64,
+) -> Result<String> {
+    use serde_json::json;
+
+    let client = reqwest::blocking::Client::new();
+    let url = format!("{}/messages", base_url);
+
+    let response = client
+        .post(&url)
+        .header("x-api-key", api_key)
+        .header("anthropic-version", "2023-06-01")
+        .header("Content-Type", "application/json")
+        .json(&json!({
+            "model": model,
+            "max_tokens": 1024,
+            "temperature": temperature,
+            "messages": [
+                {"role": "user", "content": prompt}
+            ]
+        }))
+        .send()?
+        .error_for_status()?;
+
+    let json: serde_json::Value = response.json()?;
+    let content = json["content"][0]["text"]
+        .as_str()
+        .context("Invalid response from Anthropic API")?;
+
+    Ok(content.to_string())
+}
+
+/// Google Gemini API generation
+fn google_generate(
+    api_key: &str,
+    base_url: &str,
+    model: &str,
+    prompt: &str,
+    temperature: f64,
+) -> Result<String> {
+    use serde_json::json;
+
+    let client = reqwest::blocking::Client::new();
+    let url = format!("{}/models/{}:generateContent?key={}", base_url, model, api_key);
+
+    let response = client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .json(&json!({
+            "contents": [{
+                "parts": [{
+                    "text": prompt
+                }]
+            }],
+            "generationConfig": {
+                "temperature": temperature,
+                "maxOutputTokens": 1024
+            }
+        }))
+        .send()?
+        .error_for_status()?;
+
+    let json: serde_json::Value = response.json()?;
+    let content = json["candidates"][0]["content"]["parts"][0]["text"]
+        .as_str()
+        .context("Invalid response from Google API")?;
+
+    Ok(content.to_string())
+}
+
+/// Azure OpenAI API generation
+fn azure_generate(
+    api_key: &str,
+    base_url: &str,
+    _model: &str,
+    prompt: &str,
+    temperature: f64,
+) -> Result<String> {
+    use serde_json::json;
+
+    let client = reqwest::blocking::Client::new();
+    let url = format!("{}/chat/completions?api-version=2023-05-15", base_url);
+
+    let response = client
+        .post(&url)
+        .header("api-key", api_key)
+        .header("Content-Type", "application/json")
+        .json(&json!({
+            "messages": [
+                {"role": "user", "content": prompt}
+            ],
+            "temperature": temperature,
+            "max_tokens": 1024
+        }))
+        .send()?
+        .error_for_status()?;
+
+    let json: serde_json::Value = response.json()?;
+    let content = json["choices"][0]["message"]["content"]
+        .as_str()
+        .context("Invalid response from Azure API")?;
+
+    Ok(content.to_string())
+}
+
+/// Ollama API generation (local or remote)
+fn ollama_generate(
+    _api_key: &str,
+    base_url: &str,
+    model: &str,
+    prompt: &str,
+    temperature: f64,
+) -> Result<String> {
+    use serde_json::json;
+
+    let client = reqwest::blocking::Client::new();
+    let url = format!("{}/api/generate", base_url);
+
+    let response = client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .json(&json!({
+            "model": model,
+            "prompt": prompt,
+            "stream": false,
+            "options": {
+                "temperature": temperature
+            }
+        }))
+        .send()?
+        .error_for_status()?;
+
+    let json: serde_json::Value = response.json()?;
+    let content = json["response"]
+        .as_str()
+        .context("Invalid response from Ollama API")?;
+
+    Ok(content.to_string())
+}
+
+/// Interactive chat with cloud APIs
+fn cloud_chat_loop(
+    args: &Args,
+    provider: &CloudProvider,
+    api_key: &str,
+    base_url: &str,
+    model: &str,
+) -> Result<()> {
+    println!("\n💬 Interactive cloud mode — type 'exit' or press Ctrl+C to quit");
+
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+
+    loop {
+        print!("\n🧑 You: ");
+        stdout.lock().flush()?;
+
+        let mut input = String::new();
+        stdin.lock().read_line(&mut input)?;
+        let trimmed = input.trim();
+
+        if trimmed.is_empty()
+            || trimmed.eq_ignore_ascii_case("exit")
+            || trimmed.eq_ignore_ascii_case("quit")
+        {
+            println!("\n👋 Goodbye!");
+            break;
+        }
+
+        print!("🤖 Assistant: ");
+        stdout.lock().flush()?;
+        let output = cloud_generate(args, provider, api_key, base_url, model, trimmed)?;
+        println!("{}", output);
     }
 
     Ok(())
