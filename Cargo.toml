@@ -13,7 +13,7 @@ hf-hub = "0.4"
 tokenizers = "0.21"
 
 # CLI helpers
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
