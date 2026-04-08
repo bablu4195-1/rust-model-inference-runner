@@ -1,5 +1,37 @@
-```
+```yaml
+# Dependencies
 target/
+
+# Compiled files
 **/*.rs.bk
- Cargo.lock
+**/*.rlib
+**/*.so
+**/*.dylib
+**/*.dll
+
+# Logs
+*.log
+
+# Environment
+.env
+.env.local
+.env.*
+
+# Editors
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Coverage
+coverage/
+htmlcov/
+.coverage
+
+# Temp files
+*.tmp
+*.swp
+*.swo
 ```
